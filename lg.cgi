@@ -23,15 +23,17 @@
 
 use strict qw(subs vars);
 
-$configfile = "lg.conf";
+my $configfile = "../../lg.conf";
 $ENV{HOME} = ".";	# SSH needs access for $HOME/.ssh
 
 use XML::Parser;
+use Socket;  # for sorting IPs
+use Data::Dumper;
 
 my $SYS_progid = '$Id: lg.cgi,v 1.30 2004/11/25 14:12:42 cougar Exp $';
 
 my $default_ostype = "ios";
-
+my $accessed_over_mesh = is_over_mesh();
 my $lgurl;
 my $logfile;
 my $asfile;
@@ -66,6 +68,15 @@ my $xml_current_replace_name = "";
 my $xml_current_replace_proto = "";
 
 my %valid_query = (
+	"vyos"		=>	{
+		"ipv4"			=>	{
+			"bgp"			=>	"/opt/vyatta/bin/vyatta-op-cmd-wrapper show ip bgp",
+			"origins"		=>	"/opt/vyatta/bin/vyatta-op-cmd-wrapper show ip bgp",
+			"advertised-routes"	=>	"/opt/vyatta/bin/vyatta-op-cmd-wrapper show ip bgp neighbors %s advertised-routes",
+			"summary"		=>	"/opt/vyatta/bin/vyatta-op-cmd-wrapper show ip bgp summary",
+			"ping"			=>	"/bin/ping -c 5 %s",
+			},
+		},
 	"ios"		=>	{
 		"ipv4"			=>	{
 			"bgp"			=>	"show ip bgp %s",
@@ -144,6 +155,7 @@ if ($logfile ne "") {
 }
 
 my $query_cmd = "";
+
 
 if (defined $valid_query{$ostypes{$FORM{router}}}{"ipv46"}{$FORM{query}}) {
 	$query_cmd = $valid_query{$ostypes{$FORM{router}}}{"ipv46"}{$FORM{query}};
@@ -232,6 +244,7 @@ $FORM{addr} = "" if ($FORM{addr} =~ /^[ ]*$/);
 
 if ($query_cmd =~ /%s/) {
 	&print_error("Parameter missing") if ($FORM{addr} eq "");
+	&print_error("Invalid parameter") if ($FORM{addr} !~ /^\d+\.\d+\.\d+\.\d+$/);
 } else {
 	&print_warning("No parameter needed") if ($FORM{addr} ne "");
 }
@@ -493,6 +506,7 @@ sub print_head {
 	my ($arg) = @_;
 	my ($titlestr) = $title;
 	$titlestr .= " - $arg" if ($arg ne "");
+	$titlestr =~ s/\/opt\/vyatta\/bin\/vyatta-op-cmd-wrapper//;
 	print "Content-type: text/html; charset=utf-8\n\n";
 	print "<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\">\n";
 	print "<!--\n\t$SYS_progid\n\thttp://freshmeat.net/projects/lg/\n-->\n";
@@ -510,7 +524,7 @@ sub print_head {
 	if ($logoimage ne "") {
 		print "<TABLE BORDER=\"0\" WIDTH=\"100%\"><TR><TD$logoalign>";
 		print "<A HREF=\"$logolink\">" if ($logolink ne "");
-		print "<IMG SRC=\"$logoimage\" BORDER=\"0\" ALT=\"LG\">";
+		print "<IMG height=50 SRC=\"$logoimage\" BORDER=\"0\" ALT=\"LG\">";
 		print "</A>" if ($logolink ne "");
 		print "</TD></TR></TABLE>\n";
 	}
@@ -538,11 +552,12 @@ sub print_form {
 <TH BGCOLOR="#000000" NOWRAP><FONT COLOR="#FFFFFF">Node</FONT></TH></TR>
 <TR><TD>
 <TABLE BORDER=0 CELLPADDING=2 CELLSPACING=2>
-<TR><TD><INPUT TYPE=radio NAME=query VALUE=bgp></TD><TD>&nbsp;bgp</TD></TR>
+<TR><TD><INPUT TYPE=radio NAME=query VALUE=bgp CHECKED></TD><TD>&nbsp;bgp</TD></TR>
+<TR><TD><INPUT TYPE=radio NAME=query VALUE=origins></TD><TD>&nbsp;bgp ip origins</TD></TR>
 <TR><TD><INPUT TYPE=radio NAME=query VALUE=advertised-routes></TD><TD>&nbsp;bgp&nbsp;advertised-routes</TD></TR>
 <TR><TD><INPUT TYPE=radio NAME=query VALUE=summary></TD><TD>&nbsp;bgp&nbsp;summary</TD></TR>
 <TR><TD><INPUT TYPE=radio NAME=query VALUE=ping></TD><TD>&nbsp;ping</TD></TR>
-<TR><TD><INPUT TYPE=radio NAME=query VALUE=trace CHECKED></TD><TD>&nbsp;trace</TD></TR>
+<TR><TD><INPUT TYPE=radio NAME=query VALUE=trace></TD><TD>&nbsp;trace</TD></TR>
 EOT
 	if ($ipv4enabled && $ipv6enabled) {
 		print <<EOT;
@@ -683,7 +698,9 @@ sub run_command
 
 	print "<B>Router:</B> " . html_encode($hostname) . "\n";
 	print "<BR>\n";
-	print "<B>Command:</B> " . html_encode($command) . "\n";
+	my $cmd = $command;
+	$cmd =~ s/\/opt\/vyatta\/bin\/vyatta-op-cmd-wrapper//;
+	print "<B>Command:</B> " . html_encode($cmd) . "\n";
 	print "<P><PRE><CODE>\n";
 
 	if (($command =~ /show route protocol bgp aspath-regex \"(.*)\"/) ||
@@ -705,7 +722,7 @@ sub run_command
 			use Net::SSH::Perl::Cipher;
 		";
 		die $@ if $@;
-		my $remotecmd = "$command; quit";
+		my $remotecmd = "$command";
 		$remotecmd = "set cli logical-system $logicalsystem{$FORM{router}}; " . $command if (defined $logicalsystem{$FORM{router}});
 		$port = 22 if ($port eq "");
 		my $ssh = Net::SSH::Perl->new($host, port => $port);
@@ -724,7 +741,7 @@ sub run_command
 			use Net::SSH2;
 		";
 		die $@ if $@;
-		my $remotecmd = "$command; quit";
+		my $remotecmd = "$command";
 		$remotecmd = "set cli logical-system $logicalsystem{$FORM{router}}; " . $command if (defined $logicalsystem{$FORM{router}});
 		$port = 22 if ($port eq "");
 		$ssh2 = Net::SSH2->new();
@@ -838,6 +855,10 @@ sub showlines {
 		print $input;
 		return;
 	}
+	if ($FORM{query} eq 'origins') {
+	  do_origins($input);
+	  return;
+	}
 
 	$linebuf .= $input;
 	return if ($in_func_showlines);
@@ -906,13 +927,15 @@ sub showline {
 		if (($lastip ne "") && (/(\s+inet6?\.0: )(\d+)\/(\d+)\/(\d+)$/)) {
 			s/^(\s+inet6?\.0: )(\d+)\/(\d+)\/(\d+)$/($1 . bgplink($2, "neighbors+${lastip}+routes") . "\/" . bgplink($3, "neighbors+${lastip}+routes+all") . "\/" . bgplink($4, "neighbors+${lastip}+routes+damping+suppressed"))/e;
 		}
-	} elsif (($command =~ /^show ip bgp\s+n\w*\s+[\d\.]+\s+(ro|re|a)/i) ||
-	         ($command =~ /^show bgp ipv6\s+n\w*\s+[\dA-Fa-f:]+\s+(ro|re|a)/i) ||
-	         ($command =~ /^show ip bgp\s+re/i) ||
-	         ($command =~ /^show bgp ipv6\s+re/i) ||
-	         ($command =~ /^show ip bgp\s+[\d\.]+\s+[\d\.]+\s+(l|s)/i) ||
-	         ($command =~ /^show (ip bgp|bgp ipv6) prefix-list/i) ||
-	         ($command =~ /^show (ip bgp|bgp ipv6) route-map/i)) {
+	} elsif (($command =~ /show ip bgp\s+n\w*\s+[\d\.]+\s+(ro|re|a)/i) ||
+	         ($command =~ /show bgp ipv6\s+n\w*\s+[\dA-Fa-f:]+\s+(ro|re|a)/i) ||
+	         ($command =~ /show ip bgp\s+re/i) ||
+	         ($command =~ /show bgp ipv6\s+re/i) ||
+	         ($command =~ /show ip bgp\s+[\d\.]+\s+[\d\.]+\s+(l|s)/i) ||
+	         ($command =~ /show (ip bgp|bgp ipv6) prefix-list/i) ||
+	         ($command =~ /show ip bgp/i) ||
+	         ($command =~ /show (ip bgp|bgp ipv6) route-map/i)) {
+		$_ = add_asn_tips($_);
 		s/^([\*r ](&gt;|d|h| ).{59})([\d\s,\{\}]+)([ie\?])$/($1 . as2link($3, $regexp) . $4)/e;
 		s/^([\*r ](&gt;|d|h| )[i ])([\d\.A-Fa-f:\/]+)(\s+)/($1 . bgplink($3, $3) . $4)/e;
 		s/^([\*r ](&gt;|d|h| )[i ])([\d\.A-Fa-f:\/]+)$/($1 . bgplink($3, $3))/e;
@@ -1142,7 +1165,11 @@ sub as2link {
 			}
 			my $descr = $AS{$as};
 			$descr = "$2 ($1)" if ($descr =~ /^([^:]+):(.*)$/);
-			$rep = "<A title=\"" . html_encode($descr) . "\"${link}>$astxt</A>";
+			if($accessed_over_mesh and !$FORM{'nodesc'}) {
+			  $rep = "<A title=\"" . html_encode($descr) . "\"${link}>$astxt</A>";
+			} else {
+			  $rep = "$astxt";
+			}
 		}
 		$line .= $rep . $sep;
 	}
@@ -1223,4 +1250,103 @@ sub html_encode {
 	s|<|&lt;|g;
 	s|>|&gt;|g;
 	return $_;
+}
+sub add_asn_tips {
+  my $line = shift;
+
+  my ($asns) = $line =~ /\s\s(6\d{4}.*)/;
+  my $start = substr($line, 0, length($line) - length($asns)); 
+  my $out = "";
+  foreach my $asn (split(/\s+/, $asns)) {
+    if($asn eq 'i') {
+      $out .= "i";
+      next;
+    }
+    if($AS{$asn} and $accessed_over_mesh and !$FORM{nodesc}) {
+      my $as_desc = $AS{$asn};
+  	
+      $out .= "<span style='color: #22a; cursor: help' title='$as_desc'>$asn</span> ";
+    } else {
+      $out .= "$asn ";
+    }
+  }
+
+  # fix the weird spacing on non-* entries
+  $start = " $start" if $start !~ /^\*/;
+  return $start . $out;
+}
+
+sub byip {
+  my ($a_ip) = $a =~ /(\d+\.\d+\.\d+\.\d+)/;
+  my ($b_ip) = $b =~ /(\d+\.\d+\.\d+\.\d+)/;
+  my $a_dec = unpack('N',inet_aton($a_ip));
+  my $b_dec = unpack('N',inet_aton($b_ip));
+  return $a_dec <=> $b_dec;
+}
+
+sub is_over_mesh {
+  # check if the route back is via shadymesh, if so then show sensitive info
+  my $remote_ip = $ENV{'REMOTE_ADDR'};
+  my $route_to_remote = `ip route get $remote_ip`;
+  my ($remote_gw) = $route_to_remote =~ /via\s+(\S+)/;
+  return 1 if $remote_gw eq '172.20.0.1' or !$remote_gw;
+}
+
+sub do_origins {
+  my $input = shift;
+
+  my $hide_priv = !is_over_mesh;
+
+  print "NOTICE: Hiding ASN owners for public access, use this lg via the mesh to see this information.\n\n" if $hide_priv;
+  print "NOTICE: Showing ASN owners as the lg is being accessed over the mesh.\n\n" unless $hide_priv;
+
+  my %prefixes;
+  my ($ip, $length);
+  my $carryover = 0;
+  foreach my $line (split('\n', $input)) {
+    chomp $line;
+    if($line =~ /\*?>?\s*(\d+\.\d+\.\d+\.\d+)\/(\d+)$/) {
+      # visually-long prefixes use two lines :|
+      ($ip, $length) = $line =~ /\*?>?\s*(\d+\.\d+\.\d+\.\d+)\/(\d+)/;
+      $carryover = 1;
+      next;
+    }
+    if($carryover) {
+      # already have prefix info from the previous line
+      $carryover = 0;
+    } else {
+      next unless $line =~ /\s+(i|\?)$/;
+      next if $line =~ /^\s*\*?>?\s{10}/;
+      ($ip, $length) = $line =~ /\*?>?\s*(\d+\.\d+\.\d+\.\d+)\/(\d+)/;
+      if(!$ip) {
+        ($ip) = $line =~ /\*?>?\s*(\d+\.\d+\.\d+\.\d+)/;
+        my @octets = split(/\./, $ip);
+        $length = "classful";
+        $length = 16 if $octets[0] eq '172';
+        $length = 24 if $octets[0] eq '192';
+      }
+    }
+    next unless $ip;
+    my ($last_asn, $origin) = $line =~ /(6\d{4})\s+(i|\?)$/;
+    $prefixes{"$ip/$length"} = $last_asn if $origin eq 'i';
+    $prefixes{"$ip/$length"} = "$last_asn?" if $origin eq '?';
+    $prefixes{"$ip/$length"} = '64778' if !$last_asn;
+  }
+
+  $count = 0;
+  foreach my $prefix (sort byip keys %prefixes) {
+    $count++;
+    my $asn_raw = $prefixes{$prefix};
+    my ($asn, $unsure) = $asn_raw =~ /(\d+)(\??)/;
+    my $as_desc = $AS{$asn};
+    my $tabs = "\t";
+    $tabs = "\t\t" if length($prefix) < 16;
+    if($hide_priv) {
+      print "$prefix$tabs$asn_raw\n";
+    } else {
+      print "$prefix$tabs$asn_raw\t$as_desc$unsure\n";
+    }
+  }
+
+  print "\nTotal prefixes: $count";
 }

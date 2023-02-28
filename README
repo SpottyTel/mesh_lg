@@ -11,6 +11,7 @@ either SSH, telnet or rsh protocol.
 
 LG is released under GPL licence. Look at COPYING file.
 
+This is a custom version used by SpottyTel for use on Subnet/shadymesh, which adds an "AS Origin" display, as well as displaying AS owners only when accessed via the mesh.
 
 
                                    SECURITY
